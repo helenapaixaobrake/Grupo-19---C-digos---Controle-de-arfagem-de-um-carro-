@@ -1,0 +1,73 @@
+clear; clc; close all;
+
+%% 1. Parâmetros do Veículo
+g = 9.81; ax = -7.62; r = 0.29; h = 0.626; a1 = 0.820; a2 = 0.558; ap = 0.0;
+M = 87.50; Ic = 55.75; m1 = 11.70; m2 = 12.30; mp = 50.00; Ip = 5.50;
+k1 = 4860; c1 = 1770; k2 = 8840; c2 = 2125; kt = 40000;
+kpz = 15000; cpz = 600; kphi = 15000; cphi = 600; tau_ETH = 0.02;
+
+%% 2. Ponto de Equilíbrio
+W_total = (M + mp)*g; M_brake = (M + mp)*h*ax;
+Fs_eq = [1 1; a1 -a2] \ [W_total; -M_brake];
+delta1 = Fs_eq(1)/k1; delta2 = Fs_eq(2)/k2;
+theta_eq = (delta2 - delta1)/(a1 + a2);
+
+cos_th = cos(theta_eq); a1_e = a1*cos_th; a2_e = a2*cos_th; ap_e = ap*cos_th;
+
+%% 3. Matrizes Mecânicas (q = [zc theta z1 z2 zp phi])
+M_mat = diag([M, Ic, m1, m2, mp, Ip]);
+
+K_mat = zeros(6);
+K_mat(1,:) = [k1+k2+kpz, k1*a1_e-k2*a2_e+kpz*ap_e, -k1, -k2, -kpz, 0];
+K_mat(2,:) = [K_mat(1,2), k1*a1_e^2+k2*a2_e^2+kpz*ap_e^2+kphi, -k1*a1_e, k2*a2_e, -kpz*ap_e, -kphi];
+K_mat(3,:) = [-k1, -k1*a1_e, k1+kt, 0, 0, 0];
+K_mat(4,:) = [-k2, k2*a2_e, 0, k2+kt, 0, 0];
+K_mat(5,:) = [-kpz, -kpz*ap_e, 0, 0, kpz, 0];
+K_mat(6,:) = [0, -kphi, 0, 0, 0, kphi];
+
+C_mat = zeros(6);
+C_mat(1,:) = [c1+c2+cpz, c1*a1_e-c2*a2_e+cpz*ap_e, -c1, -c2, -cpz, 0];
+C_mat(2,:) = [C_mat(1,2), c1*a1_e^2+c2*a2_e^2+cpz*ap_e^2+cphi, -c1*a1_e, c2*a2_e, -cpz*ap_e, -cphi];
+C_mat(3,:) = [-c1, -c1*a1_e, c1, 0, 0, 0];
+C_mat(4,:) = [-c2, k2*a2_e, 0, c2, 0, 0];
+C_mat(5,:) = [-cpz, -cpz*ap_e, 0, 0, cpz, 0];
+C_mat(6,:) = [0, -cphi, 0, 0, 0, cphi];
+
+F_ctrl = [1 1; a1_e -a2_e; -1 0; 0 -1; 0 0; 0 0];
+
+%% 4. Espaço de Estados Aumentado (14 estados)
+Minv = inv(M_mat); n = 14;
+
+A = [zeros(6), eye(6), zeros(6,2);
+     -Minv*K_mat, -Minv*C_mat, Minv*F_ctrl;
+     zeros(2,6), zeros(2,6), -(1/tau_ETH)*eye(2)];
+
+B = [zeros(6,2); zeros(6,2); (1/tau_ETH)*eye(2)];
+
+%% 5. Teste de Controlabilidade
+fprintf('\n===== TESTE DE CONTROLABILIDADE =====\n\n');
+
+% Método 1: Abordagem por Matriz de Kalman (ctrb)
+Ctrb_mat = ctrb(A, B); sv = svd(Ctrb_mat); rank_naive = rank(Ctrb_mat);
+tol_matlab = max(size(Ctrb_mat)) * eps(sv(1));
+
+fprintf('MÉTODO 1: ctrb() + rank() [Frágil numericamente para n=14]\n');
+fprintf('  Dimensão C(A,B): %d x %d\n', size(Ctrb_mat));
+fprintf('  Maior / Menor valor singular: %.4e / %.4e\n', sv(1), sv(end));
+fprintf('  Tolerância do rank(): %.4e\n', tol_matlab);
+fprintf('  Posto obtido: %d (Subestimado devido à escala de A^13)\n\n', rank_naive);
+
+% Método 2: Abordagem por Decomposição em Escada (ctrbf)
+[~, ~, ~, T, k_vec] = ctrbf(A, B, zeros(2,n));
+n_ctrl = sum(k_vec);
+
+fprintf('MÉTODO 2: ctrbf() [Robusto numérico]\n');
+fprintf('  Vetor k (estados por bloco): ['); fprintf('%d ', k_vec); fprintf(']\n');
+fprintf('  Total de estados controláveis: %d (n = %d)\n', n_ctrl, n);
+fprintf('------------------------------------------------------\n');
+if n_ctrl == n
+    fprintf('  >> RESULTADO: COMPLETAMENTE CONTROLÁVEL\n');
+else
+    fprintf('  >> RESULTADO: NÃO CONTROLÁVEL (%d incontroláveis)\n', n - n_ctrl);
+end
+fprintf('======================================================\n');
