@@ -1,0 +1,209 @@
+clear all; close all; clc;
+
+%% 1. Parâmetros de Controle
+VELOCIDADE_INICIAL_KMH = 50; 
+MODO_RIGIDO = false;         
+
+%% 2. Parâmetros Físicos
+g = 9.81; r = 0.29; h = 0.626; 
+
+% Massas e Geometria
+mC_base = 87.5; mp = 50; m1 = 11.7; m2 = 12.3; 
+mV = mC_base + mp + m1 + m2; 
+a1 = 0.82; a2 = 0.558; L = a1 + a2; ab = 0.1; 
+
+% Inércias e Suspensão
+ThW1 = 0.303; ThW2 = 0.303; Ip = 5.5; Iyy = 55.75;  
+cS1 = 4860; cS2 = 8840; dS1 = 1770; dS2 = 2125; 
+
+% Pneu e Freio
+kt = 40000; ct = 0; 
+TB1_max = 310; TB2_max = 110; 
+
+% Geometria e Piloto
+tan_ad_1 = tan(deg2rad(-14.3)); tan_ad_2 = tan(deg2rad(-14.65));
+kp_z = 15000; cp_z = 600; kp_phi = 15000; cp_phi = 600;
+
+% Parâmetros TMeasy (Terra/Cascalho)
+df0 = 25000; sm = 0.30; fm = 0.95; ss = 0.45; fs = 0.78;
+
+%% 3. Preparação da Simulação
+dt = 0.00005; t_final = 5.0;
+t = 0:dt:t_final; N = length(t);
+
+% Pré-alocação de Matrizes
+zc = zeros(1,N); dzc = zeros(1,N); theta = zeros(1,N); dtheta = zeros(1,N); 
+z1 = zeros(1,N); dz1 = zeros(1,N); z2 = zeros(1,N); dz2 = zeros(1,N);
+w1 = zeros(1,N); w2 = zeros(1,N); vel = zeros(1,N); x_pos = zeros(1,N); x_ddot = zeros(1,N);
+zp = zeros(1,N); dzp = zeros(1,N); phip = zeros(1,N); dphip = zeros(1,N);
+
+Fz1_plot = zeros(1,N); Fz2_plot = zeros(1,N); road1_plot = zeros(1,N); 
+Fx1_vec = zeros(1,N); Fx2_vec = zeros(1,N); slip1_plot = zeros(1,N); slip2_plot = zeros(1,N);
+
+% Condições Iniciais
+vel(1) = VELOCIDADE_INICIAL_KMH / 3.6;
+w1(1) = vel(1)/r; w2(1) = vel(1)/r;
+N1_stat = ((mC_base + mp)*g*a2/L) + m1*g;
+N2_stat = ((mC_base + mp)*g*a1/L) + m2*g;
+z1(1) = 0; z2(1) = 0; Fx1_old = 0; Fx2_old = 0; 
+
+%% 4. Loop Principal
+for i = 1:N-1
+    
+    % Cinemática longitudinal e Frenagem
+    x_pos(i+1) = x_pos(i) + vel(i)*dt; 
+    if t(i) < 0.5
+        T1 = 0; T2 = 0; 
+    else
+        ramp = min(1, (t(i)-0.5)/0.2); 
+        T1 = TB1_max * ramp; T2 = TB2_max * ramp;
+    end
+    
+    % Perfil da pista
+    if MODO_RIGIDO
+        z_road1 = 0; z_road2 = 0;
+    else
+        bump_pos = 20; bump_h = 0.1; bump_L = 0.8; 
+        x_w1 = x_pos(i) + a1; x_w2 = x_pos(i) - a2;
+        get_road = @(x) (x > bump_pos & x < bump_pos+bump_L) .* (bump_h/2 * (1 - cos(2*pi*(x-bump_pos)/bump_L)));
+        z_road1 = get_road(x_w1); z_road2 = get_road(x_w2);
+    end
+    road1_plot(i) = z_road1;
+    
+    % Forças verticais nos pneus
+    if MODO_RIGIDO
+        z1(i) = z_road1; dz1(i) = 0; z2(i) = z_road2; dz2(i) = 0;
+    else
+        Fz1_pneu = max(1, N1_stat + kt*(z_road1 - z1(i)) - ct*dz1(i));
+        Fz2_pneu = max(1, N2_stat + kt*(z_road2 - z2(i)) - ct*dz2(i));
+    end
+    
+    F_AD_1 = Fx1_old * abs(tan_ad_1); 
+    F_AD_2 = -Fx2_old * abs(tan_ad_2); 
+    
+    % Dinâmica da suspensão
+    z_chassi_pt1 = zc(i) + a1*theta(i); dz_chassi_pt1 = dzc(i) + a1*dtheta(i);
+    z_chassi_pt2 = zc(i) - a2*theta(i); dz_chassi_pt2 = dzc(i) - a2*dtheta(i);
+    
+    Fs1 = cS1*(z1(i) - z_chassi_pt1) + dS1*(dz1(i) - dz_chassi_pt1);
+    Fs2 = cS2*(z2(i) - z_chassi_pt2) + dS2*(dz2(i) - dz_chassi_pt2);
+    
+    if MODO_RIGIDO
+        Fz1_pneu = ((mC_base + mp)*g*a2/L) + m1*g + Fs1 + F_AD_1;
+        Fz2_pneu = ((mC_base + mp)*g*a1/L) + m2*g + Fs2 + F_AD_2;
+    end
+    
+    % Modelo de pneu TMeasy
+    v_transport = sqrt(vel(i)^2 + 0.5^2); 
+    slip1 = (vel(i) - w1(i)*r) / v_transport;
+    slip2 = (vel(i) - w2(i)*r) / v_transport;
+    
+    Fx1 = calc_tmeasy_book(slip1, Fz1_pneu, df0, sm, fm, ss, fs);
+    Fx2 = calc_tmeasy_book(slip2, Fz2_pneu, df0, sm, fm, ss, fs);
+    slip1_plot(i) = slip1; slip2_plot(i) = slip2;
+    
+    % Dinâmica longitudinal
+    if vel(i) < 0.05 && t(i) > 1.0 
+        Fx1 = 0; Fx2 = 0; T1 = 0; T2 = 0; vel(i) = 0; x_ddot(i+1) = 0;
+    else
+        x_ddot(i+1) = -(Fx1 + Fx2)/mV;
+    end
+    Fx1_old = Fx1; Fx2_old = Fx2;
+    
+    if vel(i) > 0 || x_ddot(i+1) > 0
+        vel(i+1) = max(0, vel(i) + x_ddot(i+1)*dt);
+    else
+        vel(i+1) = 0;
+    end
+    
+    % Dinâmica do piloto e integração
+    def_p = zp(i) - (zc(i) + ab*theta(i));
+    ddef_p = dzp(i) - (dzc(i) + ab*dtheta(i));
+    def_phi = phip(i) - theta(i);
+    ddef_phi = dphip(i) - dtheta(i);
+    
+    F_seat = -kp_z*def_p - cp_z*ddef_p; 
+    M_seat = -kp_phi*def_phi - cp_phi*ddef_phi;
+    
+    z_ddot_cg = (Fs1 + Fs2 + F_AD_1 + F_AD_2 - F_seat) / mC_base;
+    theta_ddot = ((Fs1*a1 - Fs2*a2) + (F_AD_1*a1 - F_AD_2*a2) + (mC_base+mp)*x_ddot(i+1)*h - M_seat - F_seat*ab) / Iyy;
+    
+    if MODO_RIGIDO
+        z_ddot_1 = 0; z_ddot_2 = 0; 
+    else
+        z_ddot_1 = (Fz1_pneu - N1_stat - Fs1 - F_AD_1)/m1; 
+        z_ddot_2 = (Fz2_pneu - N2_stat - Fs2 - F_AD_2)/m2;
+    end
+    
+    % Atualização de estados (Euler)
+    dzc(i+1) = dzc(i) + z_ddot_cg*dt; zc(i+1) = zc(i) + dzc(i+1)*dt;
+    dtheta(i+1) = dtheta(i) + theta_ddot*dt; theta(i+1) = theta(i) + dtheta(i+1)*dt;
+    
+    if ~MODO_RIGIDO
+        dz1(i+1) = dz1(i) + z_ddot_1*dt; z1(i+1) = z1(i) + dz1(i+1)*dt;
+        dz2(i+1) = dz2(i) + z_ddot_2*dt; z2(i+1) = z2(i) + dz2(i+1)*dt;
+    end
+    
+    dzp(i+1) = dzp(i) + (F_seat/mp)*dt; zp(i+1) = zp(i) + dzp(i+1)*dt;
+    dphip(i+1) = dphip(i) + (M_seat/Ip)*dt; phip(i+1) = phip(i) + dphip(i+1)*dt;
+    
+    w1(i+1) = max(0, w1(i) + ((Fx1*r - T1)/ThW1)*dt);
+    w2(i+1) = max(0, w2(i) + ((Fx2*r - T2)/ThW2)*dt);
+    
+    Fz1_plot(i) = Fz1_pneu; Fz2_plot(i) = Fz2_pneu;
+    Fx1_vec(i) = Fx1; Fx2_vec(i) = Fx2;
+end
+x_ddot(N) = x_ddot(N-1);
+
+%% 5. Gráficos
+figure('Name', sprintf('Simulação TMeasy - Vel Inicial: %d km/h', VELOCIDADE_INICIAL_KMH), 'Color','w', 'Units', 'normalized', 'OuterPosition', [0 0 1 1]); 
+
+subplot(3,2,1); 
+plot(t, rad2deg(theta), 'k', t, rad2deg(phip), 'm--', 'LineWidth', 1.5); 
+title('Arfagem: Chassi vs Piloto'); ylabel('Graus'); grid on; xlim([0 t_final]); legend('Chassi', 'Piloto');
+
+subplot(3,2,2);
+plot(t, w1, 'r', t, w2, 'g');
+title('Vel. Angular Rodas (rad/s)'); grid on; xlim([0 t_final]); legend('Dianteira', 'Traseira');
+
+subplot(3,2,3); 
+plot(t, vel*3.6, 'b', 'LineWidth', 2);
+title(sprintf('Velocidade (Inicial: %d km/h)', VELOCIDADE_INICIAL_KMH)); ylabel('km/h'); grid on; xlim([0 t_final]);
+
+subplot(3,2,4);
+plot(t, Fz1_plot, 'r', t, Fz2_plot, 'g'); yline(0,'k--');
+title('Carga Vertical (N)'); grid on; xlim([0 t_final]); legend('Dianteira', 'Traseira');
+
+subplot(3,2,5);
+plot(t, x_ddot/9.81, 'r', 'LineWidth', 1.5);
+title('Desaceleração (G)'); ylabel('G'); grid on; xlim([0 t_final]);
+
+subplot(3,2,6);
+plot(t, slip1_plot, 'r', t, slip2_plot, 'g', 'LineWidth', 1.5);
+yline(sm, 'k--', 'LineWidth', 1); yline(-sm, 'k--');
+title('Slip dos Pneus'); ylabel('[-]'); grid on; xlim([0 t_final]);
+legend('Dianteira', 'Traseira', 'Slip Pico (s_M)');
+
+%% 6. Função TMeasy
+function Fx = calc_tmeasy_book(sx, Fz, df0, sm, fm, ss, fs)
+    s = abs(sx);
+    if s < 1e-6
+        Fx = 0; return;
+    end
+    
+    FM = fm * Fz;
+    FS = fs * Fz;
+    
+    if s < sm
+        p = (df0 * sm / FM) - 2.0;
+        sn = s / sm;
+        f_val = (df0 / (1.0 + (sn + p) * sn)) * s;
+    elseif s < ss
+        sn = (s - sm) / (ss - sm);
+        f_val = FM - (FM - FS) * sn^2 * (3.0 - 2.0 * sn);
+    else
+        f_val = FS;
+    end
+    
+    Fx = sign(sx) * f_val;
+end
