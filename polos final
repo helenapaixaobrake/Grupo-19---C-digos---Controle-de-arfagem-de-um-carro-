@@ -1,0 +1,165 @@
+clear; clc; close all;
+
+%% 1. Parâmetros do Modelo
+g = 9.81; ax = -0.83*g; 
+r = 0.29; h = 0.626; a1 = 0.820; a2 = 0.558; ap = 0.0; 
+
+% Massas e inércias
+M = 87.50; Ic = 55.75; m1 = 11.70; m2 = 12.30; mp = 50.00; Ip = 5.5; 
+mV = M + m1 + m2 + mp; 
+
+% Rigidez e amortecimento
+k1 = 4860; c1 = 1770; k2 = 8840; c2 = 2125; kt = 40000; 
+kpz = 15000; cpz = 600; kphi = 15000; cphi = 600; 
+
+% Freio, anti-dive e atuador
+TB1max = 310.0; TB2max = 110.0; 
+gad1 = deg2rad(-14.30); gad2 = deg2rad(-14.65); 
+tau_ETH = 0.02; 
+
+%% 2. Ponto de Equilíbrio (Trim) sob Frenagem
+W_total = (M + mp)*g;
+M_brake = (M + mp)*h*ax; 
+
+A_eq = [1, 1; a1, -a2];
+b_eq = [W_total; -M_brake];
+Fs_eq = A_eq \ b_eq;
+Fs1_eq = Fs_eq(1); Fs2_eq = Fs_eq(2);
+
+delta1 = Fs1_eq / k1; delta2 = Fs2_eq / k2;
+theta_eq = (delta2 - delta1) / (a1 + a2);
+
+fprintf('--- Ponto de Operação (ax = %.2f m/s^2) ---\n', ax);
+fprintf('Força Diant: %.2f N | Força Tras: %.2f N\n', Fs1_eq, Fs2_eq);
+fprintf('Ângulo Mergulho: %.4f rad (%.2f graus)\n\n', theta_eq, rad2deg(theta_eq));
+
+% Braços projetados
+cos_th = cos(theta_eq);
+a1_e = a1 * cos_th; a2_e = a2 * cos_th; ap_e = ap * cos_th;
+
+%% 3. Matrizes Mecânicas (q = [zc theta z1 z2 zp phi])
+M_mat = diag([M, Ic, m1, m2, mp, Ip]);
+
+% Matriz de Rigidez Tangente (K_tan)
+K_mat = zeros(6,6);
+K_mat(1,:) = [k1+k2+kpz, k1*a1_e-k2*a2_e+kpz*ap_e, -k1, -k2, -kpz, 0];
+K_mat(2,:) = [K_mat(1,2), k1*a1_e^2+k2*a2_e^2+kpz*ap_e^2+kphi, -k1*a1_e, k2*a2_e, -kpz*ap_e, -kphi];
+K_mat(3,:) = [-k1, -k1*a1_e, k1+kt, 0, 0, 0];
+K_mat(4,:) = [-k2, k2*a2_e, 0, k2+kt, 0, 0];
+K_mat(5,:) = [-kpz, -kpz*ap_e, 0, 0, kpz, 0];
+K_mat(6,:) = [0, -kphi, 0, 0, 0, kphi];
+
+% Matriz de Amortecimento Tangente (C_tan)
+C_mat = zeros(6,6);
+C_mat(1,:) = [c1+c2+cpz, c1*a1_e-c2*a2_e+cpz*ap_e, -c1, -c2, -cpz, 0];
+C_mat(2,:) = [C_mat(1,2), c1*a1_e^2+c2*a2_e^2+cpz*ap_e^2+cphi, -c1*a1_e, c2*a2_e, -cpz*ap_e, -cphi];
+C_mat(3,:) = [-c1, -c1*a1_e, c1, 0, 0, 0];
+C_mat(4,:) = [-c2, c2*a2_e, 0, c2, 0, 0];
+C_mat(5,:) = [-cpz, -cpz*ap_e, 0, 0, cpz, 0];
+C_mat(6,:) = [0, -cphi, 0, 0, 0, cphi];
+
+%% 4. Acoplamentos e Espaço de Estados (14 Estados)
+F_ctrl = [1, 1; a1_e, -a2_e; -1, 0; 0, -1; 0, 0; 0, 0];
+
+t1 = abs(tan(gad1)); t2 = abs(tan(gad2)); LT = (M + mp)/mV * h; 
+F_dist = [0, 0, -t1, t2; 
+          0, 0, LT - a1_e*t1, LT - a2_e*t2; 
+          kt, 0, t1, 0; 
+          0, kt, 0, -t2; 
+          0, 0, 0, 0; 
+          0, 0, 0, 0];
+
+Minv = inv(M_mat);
+Z66 = zeros(6,6); I6 = eye(6); Z62 = zeros(6,2); Z26 = zeros(2,6);
+
+A = [Z66, I6, Z62; 
+     -Minv*K_mat, -Minv*C_mat, Minv*F_ctrl; 
+     Z26, Z26, -(1/tau_ETH)*eye(2)];
+
+B = [Z62; Z62; (1/tau_ETH)*eye(2)];
+E = [zeros(6,4); Minv*F_dist; zeros(2,4)];
+
+C_sys = zeros(2,14); C_sys(1,2) = 1; C_sys(2,6) = 1; 
+Dfull = zeros(2,6);
+
+sys = ss(A, [B, E], C_sys, Dfull);
+sys.StateName = {'zc','theta','z1','z2','zp','phi','dzc','dtheta','dz1','dz2','dzp','dphi','Fu1','Fu2'};
+sys.InputName = {'Freq1','Freq2','z01','z02','Fx1','Fx2'};
+sys.OutputName = {'theta_c','phi_p'};
+
+iFreq1=1; iFreq2=2; iz01=3; iz02=4; iFx1=5; iFx2=6;
+
+%% 5. Estabilidade e Polos
+disp('--- Polos do Sistema (eig) ---'); disp(eig(A));
+
+G = tf(sys);
+[~, den] = tfdata(G(1, iz01), 'v');
+R_table = routh(den);
+
+disp('--- Tabela de Routh (Theta_C / Pista Diant) ---'); disp(R_table);
+firstCol = R_table(:,1);
+signChanges = sum(sign(firstCol(1:end-1)) ~= sign(firstCol(2:end)));
+if signChanges == 0
+    disp('>> SISTEMA ESTÁVEL');
+else
+    fprintf('>> SISTEMA INSTÁVEL (%d mudanças de sinal)\n', signChanges);
+end
+
+%% 6. Funções de Transferência
+fprintf('\n--- Funções de Transferência (ZPK) ---\n');
+disp('1) Pista Diant (z01) -> Theta Chassi:'); zpk(G(1, iz01))
+disp('2) Pista Tras (z02) -> Theta Chassi:'); zpk(G(1, iz02))
+disp('3) Freio Diant (Fx1) -> Theta Chassi:'); zpk(G(1, iFx1))
+disp('4) Atuador Diant (Freq1) -> Theta Chassi:'); zpk(G(1, iFreq1))
+disp('5) Atuador Tras (Freq2) -> Phi Piloto:'); zpk(G(2, iFreq2))
+
+%% 7. Diagramas de Bode
+w = logspace(-1, 3, 1000);
+figure('Color','w', 'Position', [100 100 800 600]);
+bode(sys(1, iz01), 'b', sys(2, iz01), 'r--', w);
+grid on; set(findall(gcf,'Type','line'), 'LineWidth', 2);
+title('Bode: Excitação Roda Diant (z_{01})'); legend('\theta_c','\phi_p','Location','SouthWest');
+hold on; lim_y = ylim;
+line([17 17], lim_y, 'Color',[.4 .4 .4],'LineStyle',':','LineWidth',1.5,'HandleVisibility','off');
+line([50 50], lim_y, 'Color',[.4 .4 .4],'LineStyle',':','LineWidth',1.5,'HandleVisibility','off');
+text(19, -45, '\leftarrow Modo Chassi', 'FontSize',10,'FontWeight','bold');
+text(55, -90, '\leftarrow Modo Roda', 'FontSize',10,'FontWeight','bold'); hold off;
+saveas(gcf, 'bode_14estados.png');
+
+%% 8. Respostas no Tempo
+t = 0:0.005:4;
+
+% Degrau 5 cm Pista Diant
+u_road = zeros(6, length(t)); u_road(iz01, :) = 0.05;
+[y_road, t1o] = lsim(sys, u_road, t);
+
+figure('Color','w', 'Position', [100 100 800 600]);
+subplot(2,1,1); plot(t1o, rad2deg(y_road(:,1)), 'b', 'LineWidth', 2); grid on;
+title('Degrau 5 cm Roda Diant (z_{01})'); ylabel('Arfagem Chassi [º]'); legend('\theta_c');
+subplot(2,1,2); plot(t1o, rad2deg(y_road(:,2)), 'r--', 'LineWidth', 2); grid on;
+ylabel('Arfagem Piloto [º]'); xlabel('Tempo [s]'); legend('\phi_p');
+saveas(gcf, 'step_pista_14estados.png');
+
+% Degrau Frenagem
+u_brk = zeros(6, length(t)); u_brk(iFx1, :) = TB1max/r; u_brk(iFx2, :) = TB2max/r;
+[y_brk, t2o] = lsim(sys, u_brk, t);
+
+figure('Color','w', 'Position', [100 100 800 600]);
+plot(t2o, rad2deg(y_brk(:,1)), 'b', t2o, rad2deg(y_brk(:,2)), 'r--', 'LineWidth', 2);
+grid on; xlabel('Tempo [s]'); ylabel('Arfagem [º]');
+title('Degrau Frenagem (F_{x1}, F_{x2}) - Anti-dive'); legend('\theta_c','\phi_p');
+saveas(gcf, 'step_frenagem_14estados.png');
+
+% Degrau Atuador Dianteiro
+u_act = zeros(6, length(t)); u_act(iFreq1, :) = 1000;
+[y_act, t3o] = lsim(sys, u_act, t);
+
+figure('Color','w', 'Position', [100 100 800 600]);
+plot(t3o, rad2deg(y_act(:,1)), 'b', t3o, rad2deg(y_act(:,2)), 'r--', 'LineWidth', 2);
+grid on; xlabel('Tempo [s]'); ylabel('Arfagem [º]');
+title('Comando Atuador Diant (F_{req1} = 1000 N)'); legend('\theta_c','\phi_p');
+saveas(gcf, 'step_atuador_14estados.png');
+
+%% 9. Função Auxiliar
+function R = routh(a)
+    n = length(a); m =
