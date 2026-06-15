@@ -1,0 +1,120 @@
+clear; clc; close all;
+if (exist('OCTAVE_VERSION', 'builtin') ~= 0), pkg load control; end
+
+%% 1. Parâmetros Físicos da Planta
+m_C = 87.50; I_c = 55.75; m1 = 11.70; m2 = 12.30; m_p = 50.00; I_p = 5.5;    
+a1 = 0.820; a2 = 0.558; ap = 0.1; h_CG = 0.626; R_wheel = 0.290;                       
+k1 = 4860.0; k2 = 8840.0; kt = 40000.0; c1 = 1770.0; c2 = 2125.0;
+kpz = 15000.0; cpz = 600.0; kpphi = 15000.0; cpphi = 600.0;
+tau_ETH = 0.02; T_diant = 140.0; T_tras = 50.0;                       
+
+m_total = m_C + m1 + m2 + m_p; k_Sigma = k1 + k2 + kpz; c_Sigma = c1 + c2 + cpz;
+F_brake = (T_diant + T_tras) / R_wheel; a_x_plena = F_brake / m_total;                
+
+%% 2. Matrizes do Espaço de Estados (Planta e Distúrbios)
+A_sys = zeros(14);
+for i = 1:6; A_sys(i, i+6) = 1; end
+
+A_sys(7, [1,2,3,4,5]) = [-k_Sigma, -(k1*a1 - k2*a2 + kpz*ap), k1, k2, kpz] / m_C;
+A_sys(7, [7,8,9,10,11,13,14]) = [-c_Sigma, -(c1*a1 - c2*a2 + cpz*ap), c1, c2, cpz, 1, 1] / m_C;
+A_sys(8, [1,2,3,4,5,6]) = [-(k1*a1 - k2*a2 + kpz*ap), -(k1*a1^2 + k2*a2^2 + kpz*ap^2 + kpphi), k1*a1, -k2*a2, kpz*ap, kpphi] / I_c;
+A_sys(8, [7,8,9,10,11,12,13,14]) = [-(c1*a1 - c2*a2 + cpz*ap), -(c1*a1^2 + c2*a2^2 + cpz*ap^2 + cpphi), c1*a1, -c2*a2, cpz*ap, cpphi, a1, -a2] / I_c;
+A_sys(9, [1,2,3,7,8,9,13]) = [k1, k1*a1, -(k1+kt), c1, c1*a1, -c1, -1] / m1;
+A_sys(10, [1,2,4,7,8,10,14]) = [k2, -k2*a2, -(k2+kt), c2, -c2*a2, -c2, -1] / m2;
+A_sys(11, [1,2,5,7,8,11]) = [kpz, kpz*ap, -kpz, cpz, cpz*ap, -cpz] / m_p;
+A_sys(12, [2,6,8,12]) = [kpphi, -kpphi, cpphi, -cpphi] / I_p;
+A_sys(13,13) = -1/tau_ETH; A_sys(14,14) = -1/tau_ETH;
+
+C_sys = [eye(6), zeros(6,8)];
+
+E_dist = zeros(14,3);
+E_dist(9,1) = kt/m1; E_dist(10,2) = kt/m2; E_dist(8,3) = (m_total * h_CG) / I_c;        
+
+%% 3. Síntese do Observador (LQR Dual)
+Q_obs = eye(14) * 1e6; R_obs = eye(6) * 1;     
+L_obs = lqr(A_sys', C_sys', Q_obs, R_obs)';
+
+%% 4. Cenário Físico: Frenagem e Perfil de Pista (Lombada)
+v0 = 50.0/3.6; dt = 0.005; t = 0:dt:5; Nt = length(t); 
+v = zeros(1,Nt); v(1) = v0; x_cg = zeros(1,Nt); a_x_t = zeros(1,Nt); t_rampa = 0.30;   
+
+for i = 2:Nt
+    if v(i-1) > 0.01
+        ax_inst = a_x_plena * min(1.0, t(i)/t_rampa);
+        v(i) = max(0, v(i-1) - ax_inst*dt);
+        a_x_t(i) = -ax_inst;                                 
+    end
+    x_cg(i) = x_cg(i-1) + v(i)*dt;
+end
+x_diant = x_cg + a1; x_tras = x_cg - a2;
+
+% Geração vetorizada da lombada (sem loops)
+X_bump = 20.0; H_bump = 0.05; W_bump = 0.60;
+z_r1 = (H_bump/2) * (1 - cos(2*pi*(x_diant - X_bump)/W_bump)) .* (x_diant >= X_bump & x_diant <= X_bump + W_bump);
+z_r2 = (H_bump/2) * (1 - cos(2*pi*(x_tras - X_bump)/W_bump)) .* (x_tras >= X_bump & x_tras <= X_bump + W_bump);
+idx_bump = find(z_r1 > 0.0005, 1, 'first');
+
+%% 5. Montagem do Sistema Aumentado e Simulação
+A_aug = [A_sys, zeros(14); L_obs*C_sys, A_sys - L_obs*C_sys];
+B_aug = [E_dist; zeros(14,3)]; 
+C_aug = zeros(6,28); C_aug(1,1)=1; C_aug(2,15)=1; C_aug(3,2)=1; C_aug(4,16)=1; C_aug(5,5)=1; C_aug(6,6)=1;
+
+sys_cl_disc = c2d(ss(A_aug, B_aug, C_aug, zeros(6,3)), dt, 'zoh');
+
+X0_aug = zeros(28,1); X0_aug(1) = 0.02; X0_aug(15) = -0.01; % Condições iniciais errôneas deliberate
+[Y_out, T_out, ~] = lsim(sys_cl_disc, [z_r1; z_r2; a_x_t]', t, X0_aug);
+
+%% 6. Extração de Sinais e Unidades
+z_c_real = Y_out(:,1)*100; z_c_est = Y_out(:,2)*100;     
+theta_real = Y_out(:,3)*(180/pi); theta_est = Y_out(:,4)*(180/pi); 
+zp_real = Y_out(:,5)*100; phip_real = Y_out(:,6)*(180/pi);      
+
+%% 7. Painéis Gráficos
+c = [0 0.447 0.741; 0.85 0.325 0.098; 0.466 0.674 0.188; 0.494 0.184 0.556; 0.4 0.4 0.4]; % Cores
+
+% Figura 1: Dinâmica Vertical e Pista
+figure('Name','Dinâmica Vertical e Perfil de Pista','Color','w','Position',[50 100 1000 800]);
+subplot(3,1,1);
+plot(T_out, z_c_real, 'Color', c(1,:), 'LineWidth', 2); hold on;
+plot(T_out, z_c_est, 'Color', c(2,:), 'LineStyle', '--', 'LineWidth', 2); grid on; xlim([0 t(end)]);
+if ~isempty(idx_bump), xline(t(idx_bump), '--', 'Color', c(5,:), 'LineWidth', 1.2, 'Label', 'Lombada'); end
+title('Deslocamento Vertical do Chassi (z_c) - sensor desligado'); ylabel('z_c (cm)');
+legend('Planta Real', 'Estimativa Observador');
+
+subplot(3,1,2);
+plot(T_out, theta_real, 'Color', c(3,:), 'LineWidth', 2); hold on;
+plot(T_out, theta_est, 'Color', c(2,:), 'LineStyle', '--', 'LineWidth', 2);
+plot(T_out, phip_real, 'Color', c(4,:), 'LineStyle', ':', 'LineWidth', 1.5); grid on; xlim([0 t(end)]);
+if ~isempty(idx_bump), xline(t(idx_bump), '--', 'Color', c(5,:), 'LineWidth', 1.2); end
+title('Ângulo de Arfagem - Rastreamento Perfeito do Mergulho Livre'); ylabel('Ângulo (º)');
+legend('\theta_c Real', '\theta_c Estimado', '\phi_p Real');
+
+subplot(3,1,3);
+plot(T_out, z_r1*100, 'Color', c(2,:), 'LineWidth', 2); hold on;
+plot(T_out, z_r2*100, 'Color', c(1,:), 'LineStyle', '--', 'LineWidth', 2); grid on; xlim([0 t(end)]); ylim([-0.5 6]);
+title('Perfil de Pista — Lombada de 5 cm em x = 20 m'); ylabel('Pista (cm)'); xlabel('Tempo (s)');
+legend('Roda Dianteira', 'Roda Traseira');
+
+% Figura 2: Dinâmica Longitudinal (Distúrbios)
+figure('Name','Dinâmica Longitudinal (Distúrbios)','Color','w','Position',[1100 500 800 400]);
+subplot(2,1,1);
+plot(T_out, v*3.6, 'Color', c(4,:), 'LineWidth', 2); grid on; xlim([0 t(end)]); ylim([-2 55]);
+if ~isempty(idx_bump), xline(t(idx_bump), '--', 'Color', c(5,:), 'LineWidth', 1.2, 'Label', 'Lombada'); end
+title('Velocidade Longitudinal'); ylabel('km/h');
+
+subplot(2,1,2);
+plot(T_out, a_x_t, 'k', 'LineWidth', 2); hold on;
+yline(-a_x_plena, ':', 'Color', c(2,:), 'LineWidth', 1.5, 'Label', sprintf('%.1f m/s²', a_x_plena));
+grid on; xlim([0 t(end)]); title('Aceleração Longitudinal (Distúrbio de Frenagem)'); ylabel('a_x (m/s²)'); xlabel('Tempo (s)');
+
+% Figura 3: Convergência do Observador (Zoom Inicial)
+figure('Name','Convergência do Observador — Zoom','Color','w','Position',[1100 40 800 400]);
+subplot(2,1,1);
+plot(T_out, z_c_real, 'Color', c(1,:), 'LineWidth', 2); hold on;
+plot(T_out, z_c_est, 'k--', 'LineWidth', 2); grid on; xlim([0 2.0]);
+title('Convergência do Observador: Correção Inicial do z_c'); ylabel('z_c (cm)'); legend('Planta Real', 'Estimado');
+
+subplot(2,1,2);
+plot(T_out, theta_real, 'Color', c(3,:), 'LineWidth', 2); hold on;
+plot(T_out, theta_est, 'k--', 'LineWidth', 2); grid on; xlim([0 2.0]);
+title('Convergência do Observador: Correção Inicial de \theta_c'); ylabel('\theta_c (º)'); xlabel('Tempo (s)'); legend('Planta Real', 'Estimado');
