@@ -1,0 +1,97 @@
+clear; clc; close all;
+if (exist('OCTAVE_VERSION', 'builtin') ~= 0), pkg load control; end
+
+%% 1. Parâmetros do Veículo e Matrizes (14 Estados)
+m_C = 87.5; I_c = 55.75; m1 = 11.7; m2 = 12.3; m_p = 50.0; I_p = 10.0;
+a1 = 0.82; a2 = 0.558; ap = 0.1; h_cg = 0.45; g = 9.81; tau_ETH = 0.02;
+k1 = 4860; k2 = 8840; kt = 40000; c1 = 1770; c2 = 2125;
+kpz = 15000; kpphi = 15000; cpz = 600; cpphi = 600;
+
+k_Sigma = k1 + k2 + kpz; c_Sigma = c1 + c2 + cpz; m_tot = m_C + m_p + m1 + m2;
+
+A_sys = zeros(14);
+A_sys(1,7)=1; A_sys(2,8)=1; A_sys(3,9)=1; A_sys(4,10)=1; A_sys(5,11)=1; A_sys(6,12)=1;
+
+% Dinâmica de forças e momentos
+A_sys(7, [1,2,3,4,5]) = [-k_Sigma, -(k1*a1 - k2*a2 + kpz*ap), k1, k2, kpz] / m_C;
+A_sys(7, [7,8,9,10,11,13,14]) = [-c_Sigma, -(c1*a1 - c2*a2 + cpz*ap), c1, c2, cpz, 1, 1] / m_C;
+A_sys(8, [1,2,3,4,5,6]) = [-(k1*a1 - k2*a2 + kpz*ap), -(k1*a1^2 + k2*a2^2 + kpz*ap^2 + kpphi), k1*a1, -k2*a2, kpz*ap, kpphi] / I_c;
+A_sys(8, [7,8,9,10,11,12,13,14]) = [-(c1*a1 - c2*a2 + cpz*ap), -(c1*a1^2 + c2*a2^2 + cpz*ap^2 + cpphi), c1*a1, -c2*a2, cpz*ap, cpphi, a1, -a2] / I_c;
+A_sys(9, [1,2,3,7,8,9,13]) = [k1, k1*a1, -(k1+kt), c1, c1*a1, -c1, -1] / m1;
+A_sys(10, [1,2,4,7,8,10,14]) = [k2, -k2*a2, -(k2+kt), c2, -c2*a2, -c2, -1] / m2;
+A_sys(11, [1,2,5,7,8,11]) = [kpz, kpz*ap, -kpz, cpz, cpz*ap, -cpz] / m_p;
+A_sys(12, [2,6,8,12]) = [kpphi, -kpphi, cpphi, -cpphi] / I_p;
+A_sys(13,13) = -1/tau_ETH; A_sys(14,14) = -1/tau_ETH;
+
+B_sys = zeros(14, 2); B_sys(13,1) = 1/tau_ETH; B_sys(14,2) = 1/tau_ETH;
+E_sys = zeros(14, 1); E_sys(8,1) = (m_tot * h_cg) / I_c;
+
+%% 2. Projeto de Controle: LQR Base
+Q_lqr = zeros(14); Q_lqr(2,2) = 8e6; Q_lqr(8,8) = 5e4; R_lqr = diag([0.05, 0.05]);
+K_lqr = lqr(A_sys, B_sys, Q_lqr, R_lqr);
+sys_cl_lqr = ss(A_sys - B_sys * K_lqr, E_sys, eye(14), zeros(14,1));
+
+%% 3. Projeto de Controle: Alocação de Polos Dominantes
+lim_dominante = -8; desloc = 5;
+polos_LQR = eig(A_sys - B_sys * K_lqr);
+novos_polos = polos_LQR;
+
+% Vetorização que substitui o loop 'for' anterior
+idx = real(novos_polos) > lim_dominante;
+novos_polos(idx) = real(novos_polos(idx)) - desloc + 1i * imag(novos_polos(idx));
+
+disp('--- POLOS DE MALHA FECHADA (LQR vs Alocação) ---');
+disp([polos_LQR, novos_polos]);
+
+K_place = place(A_sys, B_sys, novos_polos);
+sys_cl_place = ss(A_sys - B_sys * K_place, E_sys, eye(14), zeros(14,1));
+
+% Diagnóstico de robustez
+[Vc, ~] = eig(A_sys - B_sys * K_place);
+fprintf('\n--- Diagnóstico de Robustez ---\n');
+fprintf('Max real(polo): %.4f\nCondicionamento Vc: %.4e\n', max(real(eig(A_sys - B_sys*K_place))), cond(Vc));
+fprintf('Norma K_place: %.2f | Norma K_lqr: %.2f\n', norm(K_place), norm(K_lqr));
+
+%% 4. Dinâmica de Frenagem (Perturbação)
+dt = 0.005; t = 0:dt:5; N = length(t);
+ax_G = zeros(N, 1); V_ms = zeros(N, 1); V_ms(1) = 50 / 3.6;
+
+for i = 2:N
+    target_ax = -0.88 * (t(i) >= 0.5 && V_ms(i-1) > 0.01);
+    ax_G(i) = ax_G(i-1) + (target_ax - ax_G(i-1)) * (dt / 0.05);
+    V_ms(i) = max(0, V_ms(i-1) + (ax_G(i) * g) * dt);
+end
+w_disturbio = ax_G * g;
+
+%% 5. Simulação no Tempo e Resultados
+[X_lqr, ~] = lsim(sys_cl_lqr, w_disturbio', t);
+[X_place, ~] = lsim(sys_cl_place, w_disturbio', t);
+U_lqr = -K_lqr * X_lqr'; U_place = -K_place * X_place';
+
+fprintf('\n--- Resumo dos Resultados ---\n');
+fprintf('Pico Arfagem LQR: %.3fº | Alocação: %.3fº\n', max(abs(X_lqr(:,2)*180/pi)), max(abs(X_place(:,2)*180/pi)));
+fprintf('Força Máx Diant. LQR: %.1f N | Alocação: %.1f N\n', max(abs(U_lqr(1,:))), max(abs(U_place(1,:))));
+
+%% 6. Plotagem: Resposta Temporal Comparativa
+if ~exist('figures', 'dir'), mkdir('figures'); end
+
+figure('Name', 'Comparativo Temporal', 'Color', 'w', 'Position', [100, 100, 1000, 600]);
+subplot(2, 1, 1);
+plot(t, X_lqr(:,2)*(180/pi), 'k', t, X_place(:,2)*(180/pi), 'r--', 'LineWidth', 2.5);
+title('Comparativo do Ângulo de Arfagem (Chassi)'); ylabel('Graus'); grid on; ylim([-6 2]);
+legend('LQR', 'Alocação', 'Box', 'off');
+
+subplot(2, 1, 2);
+plot(t, U_lqr(1,:), 'b', t, U_place(1,:), 'm--', 'LineWidth', 2);
+title('Esforço de Controle Requerido (Atuador Dianteiro)'); ylabel('Força (N)'); xlabel('Tempo (s)'); grid on;
+legend('LQR', 'Alocação', 'Box', 'off');
+saveas(gcf, 'figures/comparativo_controle.jpg');
+
+%% 7. Plotagem: Mapa de Polos
+figure('Name', 'Mapa de Polos', 'Color', 'w', 'Position', [150, 150, 800, 600]);
+plot(real(polos_LQR), imag(polos_LQR), 'bx', 'MarkerSize', 10, 'LineWidth', 2); hold on;
+plot(real(novos_polos), imag(novos_polos), 'ro', 'MarkerSize', 8, 'LineWidth', 2); grid on;
+xline(0, 'k-', 'LineWidth', 1.5); yline(0, 'k-', 'LineWidth', 0.5);
+title('Mapa de Polos em Malha Fechada'); xlabel('Eixo Real (\sigma)'); ylabel('Eixo Imaginário (j\omega)');
+legend('LQR', 'Alocação', 'Box', 'off'); xlim([-60 5]); ylim([-40 40]);
+saveas(gcf, 'figures/mapa_polos.jpg');
