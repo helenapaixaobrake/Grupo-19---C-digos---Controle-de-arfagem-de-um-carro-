@@ -1,0 +1,91 @@
+clear; clc; close all;
+if (exist('OCTAVE_VERSION', 'builtin') ~= 0), pkg load control; end
+
+%% 1. Parâmetros do Veículo
+m_C = 87.5; I_c = 55.75; m1 = 11.7; m2 = 12.3; m_p = 50.0; I_p = 5.5;
+a1 = 0.82; a2 = 0.558; ap = 0.1; h_cg = 0.45; g = 9.81; tau_ETH = 0.02;
+k1 = 4860; k2 = 8840; kt = 40000; c1 = 1770; c2 = 2125;
+kpz = 15000; kpphi = 15000; cpz = 600; cpphi = 600;
+
+k_Sigma = k1 + k2 + kpz; c_Sigma = c1 + c2 + cpz; m_tot = m_C + m_p + m1 + m2;
+
+%% 2. Matrizes do Espaço de Estados (14 Estados)
+A_sys = zeros(14);
+A_sys(1,7)=1; A_sys(2,8)=1; A_sys(3,9)=1; A_sys(4,10)=1; A_sys(5,11)=1; A_sys(6,12)=1;
+
+% Dinâmica de forças e momentos
+A_sys(7, [1,2,3,4,5]) = [-k_Sigma, -(k1*a1 - k2*a2 + kpz*ap), k1, k2, kpz] / m_C;
+A_sys(7, [7,8,9,10,11,13,14]) = [-c_Sigma, -(c1*a1 - c2*a2 + cpz*ap), c1, c2, cpz, 1, 1] / m_C;
+A_sys(8, [1,2,3,4,5,6]) = [-(k1*a1 - k2*a2 + kpz*ap), -(k1*a1^2 + k2*a2^2 + kpz*ap^2 + kpphi), k1*a1, -k2*a2, kpz*ap, kpphi] / I_c;
+A_sys(8, [7,8,9,10,11,12,13,14]) = [-(c1*a1 - c2*a2 + cpz*ap), -(c1*a1^2 + c2*a2^2 + cpz*ap^2 + cpphi), c1*a1, -c2*a2, cpz*ap, cpphi, a1, -a2] / I_c;
+A_sys(9, [1,2,3,7,8,9,13]) = [k1, k1*a1, -(k1+kt), c1, c1*a1, -c1, -1] / m1;
+A_sys(10, [1,2,4,7,8,10,14]) = [k2, -k2*a2, -(k2+kt), c2, -c2*a2, -c2, -1] / m2;
+A_sys(11, [1,2,5,7,8,11]) = [kpz, kpz*ap, -kpz, cpz, cpz*ap, -cpz] / m_p;
+A_sys(12, [2,6,8,12]) = [kpphi, -kpphi, cpphi, -cpphi] / I_p;
+A_sys(13,13) = -1/tau_ETH; A_sys(14,14) = -1/tau_ETH;
+
+% Entradas de Controle e Perturbação
+B_sys = zeros(14, 2); B_sys(13,1) = 1/tau_ETH; B_sys(14,2) = 1/tau_ETH;
+E_sys = zeros(14, 1); E_sys(8,1) = (m_tot * h_cg) / I_c;
+
+%% 3. Sintonia do LQR
+Q_lqr = zeros(14); Q_lqr(2,2) = 8e6; Q_lqr(8,8) = 5e4;
+R_lqr = diag([0.05, 0.05]);
+
+K_lqr = lqr(A_sys, B_sys, Q_lqr, R_lqr);
+sys_cl = ss(A_sys - B_sys * K_lqr, E_sys, eye(14), zeros(14,1));
+
+%% 4. Perfil de Perturbação (Frenagem)
+dt = 0.005; t = 0:dt:5; N = length(t);
+ax_G = zeros(1, N); V_ms = zeros(1, N); V_ms(1) = 50 / 3.6;
+
+for i = 2:N
+    target_ax = -0.88 * (t(i) >= 0.5 && V_ms(i-1) > 0.01);
+    ax_G(i) = ax_G(i-1) + (target_ax - ax_G(i-1)) * (dt / 0.05);
+    V_ms(i) = max(0, V_ms(i-1) + (ax_G(i) * g) * dt);
+end
+
+V_kmh = V_ms * 3.6; w_diant = V_ms / 0.3; w_tras = V_ms / 0.3;
+w_disturbio = ax_G * g;
+
+%% 5. Simulação Numérica e Forças
+[X_cl, ~] = lsim(sys_cl, w_disturbio, t);
+U_cl = -K_lqr * X_cl';
+
+W_stat_d = 650; W_stat_t = 900; 
+Fz_diant = W_stat_d - kt * X_cl(:, 3); Fz_tras = W_stat_t - kt * X_cl(:, 4);
+
+%% 6. Painel de Gráficos (3x2)
+figure('Name', 'LQR Ativo: Rejeição de Arfagem', 'Color', 'w', 'Position', [100, 50, 1100, 850]);
+
+% 1. Arfagem
+subplot(3, 2, 1);
+plot(t, X_cl(:,2)*(180/pi), 'k', 'LineWidth', 3); hold on;
+plot(t, X_cl(:,6)*(180/pi), 'm--', 'LineWidth', 2);
+title('1. Arfagem (Graus)'); ylabel('Graus'); legend('Chassi', 'Piloto'); grid on; ylim([-6 2]);
+
+% 2. Velocidade Rodas
+subplot(3, 2, 2);
+plot(t, w_diant, 'r', t, w_tras, 'g', 'LineWidth', 2);
+title('2. Vel. Angular Rodas (rad/s)'); legend('Dianteira', 'Traseira'); grid on; ylim([-5 60]);
+
+% 3. Velocidade Veículo
+subplot(3, 2, 3);
+plot(t, V_kmh, 'b', 'LineWidth', 3);
+title('3. Velocidade do Veículo (km/h)'); ylabel('km/h'); grid on; ylim([-5 60]);
+
+% 4. Carga nos Pneus
+subplot(3, 2, 4);
+plot(t, Fz_diant, 'r', t, Fz_tras, 'g', 'LineWidth', 2);
+title('4. Carga Vertical nos Pneus (N)'); legend('Dianteira', 'Traseira'); grid on; ylim([0 2000]);
+
+% 5. Desaceleração
+subplot(3, 2, 5);
+plot(t, ax_G, 'r', 'LineWidth', 3);
+title('5. Desaceleração Longitudinal (G)'); ylabel('G'); xlabel('Tempo (s)'); grid on; ylim([-1.2 0.2]);
+
+% 6. Forças dos Atuadores
+subplot(3, 2, 6);
+plot(t, U_cl(1,:), 'b', t, U_cl(2,:), 'c', 'LineWidth', 2);
+title('6. Força dos Atuadores Suspensão Ativa (N)'); ylabel('N'); xlabel('Tempo (s)');
+legend('Atuador Diant.', 'Atuador Tras.'); grid on; ylim([-800 800]);
