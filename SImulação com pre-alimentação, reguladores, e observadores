@@ -1,0 +1,123 @@
+clear; clc; close all;
+if (exist('OCTAVE_VERSION', 'builtin') ~= 0), pkg load control; end
+
+%% 1. Parâmetros Físicos (ap = 0 — Hipótese do Deck)
+m_C = 87.50; I_c = 55.75; m1 = 11.70; m2 = 12.30; m_p = 50.00; I_p = 5.5;
+a1 = 0.820; a2 = 0.558; ap = 0.0; h_CG = 0.626; g = 9.81;     
+k1 = 4860.0; k2 = 8840.0; kt = 40000.0; c1 = 1770.0; c2 = 2125.0;
+kpz = 15000.0; cpz = 600.0; kpphi = 15000.0; cpphi = 600.0; tau_ETH = 0.02;
+
+m_total = m_C + m1 + m2 + m_p; k_Sigma = k1 + k2 + kpz; c_Sigma = c1 + c2 + cpz;
+
+%% 2. Matrizes do Espaço de Estados (14 Estados)
+A_sys = zeros(14);
+for i = 1:6; A_sys(i, i+6) = 1; end
+
+A_sys(7, [1,2,3,4,5]) = [-k_Sigma, -(k1*a1 - k2*a2 + kpz*ap), k1, k2, kpz] / m_C;
+A_sys(7, [7,8,9,10,11,13,14]) = [-c_Sigma, -(c1*a1 - c2*a2 + cpz*ap), c1, c2, cpz, 1, 1] / m_C;
+A_sys(8, [1,2,3,4,5,6]) = [-(k1*a1 - k2*a2 + kpz*ap), -(k1*a1^2 + k2*a2^2 + kpz*ap^2 + kpphi), k1*a1, -k2*a2, kpz*ap, kpphi] / I_c;
+A_sys(8, [7,8,9,10,11,12,13,14]) = [-(c1*a1 - c2*a2 + cpz*ap), -(c1*a1^2 + c2*a2^2 + cpz*ap^2 + cpphi), c1*a1, -c2*a2, cpz*ap, cpphi, a1, -a2] / I_c;
+A_sys(9, [1,2,3,7,8,9,13]) = [k1, k1*a1, -(k1+kt), c1, c1*a1, -c1, -1] / m1;
+A_sys(10, [1,2,4,7,8,10,14]) = [k2, -k2*a2, -(k2+kt), c2, -c2*a2, -c2, -1] / m2;
+A_sys(11, [1,2,5,7,8,11]) = [kpz, kpz*ap, -kpz, cpz, cpz*ap, -cpz] / m_p;
+A_sys(12, [2,6,8,12]) = [kpphi, -kpphi, cpphi, -cpphi] / I_p;
+A_sys(13,13) = -1/tau_ETH; A_sys(14,14) = -1/tau_ETH;
+
+C_sys = [eye(6), zeros(6,8)];
+B_MIMO = zeros(14,2); B_MIMO(13,1) = 1/tau_ETH; B_MIMO(14,2) = 1/tau_ETH;
+E_dist = zeros(14,3); E_dist(9,1) = kt/m1; E_dist(10,2) = kt/m2; E_dist(8,3) = (m_total*h_CG)/I_c;
+
+%% 3. Síntese do Controlador LQR e Observador Dual
+Q = zeros(14); Q(2,2) = 8e6; Q(8,8) = 5e4; R_lqr = eye(2) * 0.05;
+Kx = lqr(A_sys, B_MIMO, Q, R_lqr);
+
+Q_obs = eye(14) * 1e3; R_obs = eye(6);
+L_obs = lqr(A_sys', C_sys', Q_obs, R_obs)';
+
+%% 4. Projeto do Feedforward (Pré-Alimentação)
+Cc = zeros(2,14); Cc(1,2) = 1; Cc(2,1) = 1; % Saídas reguladas: theta_c e z_c
+
+% Uso do operador backslash (\) substituindo inv() para estabilidade numérica
+Gx = (A_sys - B_MIMO * Kx) \ eye(14);
+D_eff = E_dist - B_MIMO * Kx * ((A_sys - L_obs * C_sys) \ E_dist);
+
+Nw = -(Cc * Gx * B_MIMO) \ (Cc * Gx * D_eff(:,3)); 
+M_ff = zeros(2,3); M_ff(:,3) = Nw; 
+fprintf('Ganho de Feedforward Nw: Fu1 = %.2f N, Fu2 = %.2f N (por m/s²)\n', Nw(1), Nw(2));
+
+%% 5. Cenário de Frenagem Suave + Lombada
+G_FRENAGEM = 0.88; a_x_plena = G_FRENAGEM * g;
+v0 = 50.0/3.6; dt = 0.005; t = 0:dt:5; Nt = length(t);
+v = zeros(1,Nt); v(1) = v0; x_cg = zeros(1,Nt); a_x_t = zeros(1,Nt); t_rampa = 0.30;
+
+for i = 2:Nt
+    if v(i-1) > 0.01
+        ax_inst = a_x_plena * min(1.0, t(i)/t_rampa);
+        v(i) = max(0, v(i-1) - ax_inst*dt); a_x_t(i) = -ax_inst;
+    end
+    x_cg(i) = x_cg(i-1) + v(i)*dt;
+end
+x_diant = x_cg + a1; x_tras = x_cg - a2;
+
+% Geração de perfil de pista 100% vetorizado
+X_bump = 20.0; H_bump = 0.05; W_bump = 0.60;
+z_r1 = (H_bump/2) * (1 - cos(2*pi*(x_diant - X_bump)/W_bump)) .* (x_diant >= X_bump & x_diant <= X_bump + W_bump);
+z_r2 = (H_bump/2) * (1 - cos(2*pi*(x_tras - X_bump)/W_bump)) .* (x_tras >= X_bump & x_tras <= X_bump + W_bump);
+
+idx_stop = find(v <= 1e-3, 1, 'first'); if isempty(idx_stop), idx_stop = Nt; end
+t_stop = t(idx_stop);
+U_sim = [z_r1; z_r2; a_x_t]'; X0 = zeros(28,1); X0(1) = 0.02;
+
+%% 6. Simulações Comparativas em Malha Fechada
+A_aug = [A_sys, -B_MIMO*Kx; L_obs*C_sys, A_sys - B_MIMO*Kx - L_obs*C_sys];
+
+% (a) LQR + Observador (Sem Feedforward)
+B_a0 = [E_dist; zeros(14,3)];
+[X0t, T_out, ~] = lsim(c2d(ss(A_aug, B_a0, eye(28), zeros(28,3)), dt, 'zoh'), U_sim, t, X0);
+th_semff = X0t(:,2) * 180/pi;
+
+% (b) LQR + Observador + Feedforward completo
+B_aff = [E_dist + B_MIMO*M_ff; B_MIMO*M_ff];
+[Xff, ~, ~] = lsim(c2d(ss(A_aug, B_aff, eye(28), zeros(28,3)), dt, 'zoh'), U_sim, t, X0);
+th_ff = Xff(:,2) * 180/pi; zc_ff = Xff(:,1) * 100;
+U_ctrl = -(Kx * Xff(:,15:28).')' + (M_ff * U_sim')';
+
+% (c) Planta em Malha Aberta (Referencial)
+[Xol, ~, ~] = lsim(c2d(ss(A_sys, E_dist, eye(14), zeros(14,3)), dt, 'zoh'), U_sim, t, zeros(14,1));
+th_ol = Xol(:,2) * 180/pi;
+
+%% 7. Painéis Gráficos e Resultados
+c = [0 0.447 0.741; 0.85 0.325 0.098; 0.466 0.674 0.188; 0.3 0.3 0.3];
+
+% Figura 1: Performance de Rejeição de Distúrbio
+figure('Name','LQR + Observador + Feedforward','Color','w','Position',[60 40 1000 780]);
+subplot(3,1,1);
+plot(T_out, th_ol, 'Color', [.6 .6 .6], 'LineWidth', 2); hold on;
+plot(T_out, th_semff, 'Color', c(2,:), 'LineWidth', 2, 'LineStyle', '-.');
+plot(T_out, th_ff, 'Color', c(3,:), 'LineWidth', 2.5); grid on; xlim([0 5]); yline(0, 'k:');
+xline(t_stop, ':', 'Color', c(4,:), 'LineWidth', 1.8, 'Label', 'Carro Parado');
+title('Arfagem \theta_c — Frenagem Absoluta (0,88g)'); ylabel('\theta_c (º)');
+legend('Malha Aberta', 'LQR + Obs (Sem FF)', 'LQR + Obs + Feedforward');
+
+subplot(3,1,2);
+plot(T_out, zc_ff, 'Color', c(1,:), 'LineWidth', 2.2); grid on; xlim([0 5]); yline(0, 'k:');
+xline(t_stop, ':', 'Color', c(4,:), 'LineWidth', 1.8, 'Label', 'Carro Parado');
+title('Deslocamento Vertical z_c (Malha Fechada com Feedforward)'); ylabel('z_c (cm)');
+
+subplot(3,1,3);
+plot(T_out, U_ctrl(:,1), 'Color', c(1,:), 'LineWidth', 2); hold on;
+plot(T_out, U_ctrl(:,2), 'Color', c(2,:), 'LineWidth', 2, 'LineStyle', '--'); grid on; xlim([0 5]); ylim([-1000 1000]);
+yline([800, -800], 'r:'); xline(t_stop, ':', 'Color', c(4,:), 'LineWidth', 1.8, 'Label', 'Carro Parado');
+title('Esforço de Controle Requerido (Alvos Lineares Estáveis)'); ylabel('Força (N)'); xlabel('Tempo (s)');
+legend('F_{u1} (Diant.)', 'F_{u2} (Tras.)');
+
+% Figura 2: Perfil Dinâmico de Velocidade
+figure('Name','Velocidade do Veículo','Color','w','Position',[80 60 800 340]);
+plot(t, v*3.6, 'Color', [0.2 0.2 0.7], 'LineWidth', 2.2); grid on; xlim([0 5]); ylim([-2 55]); yline(0, 'k:');
+xline(t_stop, ':', 'Color', c(4,:), 'LineWidth', 1.8, 'Label', sprintf('v = 0 em %.2f s', t_stop));
+title('Velocidade Longitudinal de Desaceleração'); ylabel('Velocidade (km/h)'); xlabel('Tempo (s)');
+
+% Relatório de Console
+fprintf('\n--- Performance Final (Regime Permanente) ---\n');
+fprintf('Arfagem final: Sem FF = %.2fº | Com FF = %.3fº\n', th_semff(end), th_ff(end));
+fprintf('Esforço Máximo: |Fu1| = %.0f N | |Fu2| = %.0f N\n', max(abs(U_ctrl(:,1))), max(abs(U_ctrl(:,2))));
